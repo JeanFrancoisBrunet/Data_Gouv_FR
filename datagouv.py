@@ -4,7 +4,7 @@
 Sous-commandes (aucune clé API requise ; lecture seule sur le réseau) :
   chercher <mots…>            jeux de données correspondant aux mots-clés (numérotés) ; « chercher suite » = page suivante
   apis <mots…>                API (« dataservices ») correspondant aux mots-clés
-  infos <n|id>                détail d'un jeu de données : producteur, licence, fichiers (numérotés)
+  infos <n|id> [fichier]      détail d'un jeu de données (fichiers numérotés) ; avec un n° de fichier : son adresse directe
   squelette <n|id> [fichier]  génère un programme Python autonome (pandas) pour un fichier CSV/XLSX
   siren <9 chiffres>          fiche d'une entreprise : état administratif (Sirene) + procédures collectives (BODACC)
   --check                     diagnostic : joint data.gouv.fr et vérifie la structure des réponses
@@ -184,11 +184,14 @@ def _items(js) -> list:
     return []
 
 
-def _save_last(kind: str, items: list, q: str = "", page: int = 1):
+def _save_last(kind: str, items: list, q: str = "", page: int = 1, total=None, prev=None):
+    """Mémorise la liste affichée. Avec « suite », les résultats des pages précédentes sont conservés :
+    la numérotation continue (9, 10… sur la page 2) et tous les numéros restent utilisables."""
+    light = [{"id": i.get("id"), "slug": i.get("slug"), "title": i.get("title")} for i in items]
     try:
         LAST_FILE.write_text(json.dumps(
-            {"kind": kind, "q": q, "page": page, "items": [{"id": i.get("id"), "slug": i.get("slug"), "title": i.get("title")}
-                                     for i in items]}, ensure_ascii=False), encoding="utf-8")
+            {"kind": kind, "q": q, "page": page, "total": total, "items": list(prev or []) + light},
+            ensure_ascii=False), encoding="utf-8")
     except OSError:
         pass
 
@@ -196,7 +199,7 @@ def _save_last(kind: str, items: list, q: str = "", page: int = 1):
 def resolve_dataset(ref: str) -> str:
     """Numéro (dernière recherche) → id ; id ou slug → tel quel après validation stricte."""
     ref = (ref or "").strip().lower()
-    if ref.isdigit() and len(ref) <= 2:
+    if ref.isdigit() and len(ref) <= 3:
         try:
             last = json.loads(LAST_FILE.read_text(encoding="utf-8"))
             if last.get("kind") != "datasets":
@@ -233,6 +236,10 @@ def _is_tabular(r: dict) -> bool:
     return bool(_norm_format(r))
 
 
+def _is_zip(r: dict) -> bool:
+    return str(r.get("format") or "").strip().lower() == "zip" or str(r.get("url") or "").lower().split("?")[0].endswith(".zip")
+
+
 # ─────────────────────────── commandes ───────────────────────────
 def _search_datasets(q: str, page: int = 1):
     js = get_json(f"{API}/datasets/?q={urllib.parse.quote(q)}&page_size={PAGE_SIZE}" + (f"&page={page}" if page > 1 else ""))
@@ -257,14 +264,24 @@ def cmd_chercher(words):
     import itertools
     q = _kw(words)
     page = 1
+    prev = []
     if q.lower() in ("suite", "page suivante", "plus"):
         st = _last_state()
         if st.get("kind") != "datasets" or not st.get("q"):
             return "❌ Pas de recherche précédente : lancez d'abord « chercher <mots> »."
         q, page = st["q"], int(st.get("page", 1)) + 1
+        prev = list(st.get("items") or [])
+        tot = st.get("total")
+        if isinstance(tot, int) and (page - 1) * PAGE_SIZE >= tot:
+            return f"🔍 Dernière page atteinte : « {q} » n'a que {tot} résultat(s). Essayez d'autres mots."
     if not q:
         return "❌ Usage : chercher <mots-clés>   ex : chercher pépinières entreprises  |  chercher suite (page suivante)"
-    items, total = _search_datasets(q, page)
+    try:
+        items, total = _search_datasets(q, page)
+    except DGError as e:
+        if page > 1 and ("HTTP 400" in str(e) or "HTTP 404" in str(e)):
+            return f"🔍 Dernière page atteinte pour « {q} »."
+        raise
     note = ""
     ws = q.split()
     if not items and page == 1 and any(w.lower().endswith("s") and len(w) > 4 for w in ws):
@@ -294,10 +311,18 @@ def cmd_chercher(words):
     if not items:
         return (f"🔍 Aucun jeu de données pour « {q} »." if page == 1 else "🔍 Plus de résultats.") + \
                "\n   Astuce : 1 à 2 mots précis (le thème, pas la phrase) ; essayez le singulier ou un synonyme."
-    _save_last("datasets", items, q, page)
+    dup = 0
+    if page > 1:     # l'ordre des résultats peut légèrement varier d'une page à l'autre : on écarte les doublons
+        seen = {i.get("id") for i in prev}
+        fresh = [d for d in items if d.get("id") not in seen]
+        dup, items = len(items) - len(fresh), fresh
+    offset = len(prev)
+    _save_last("datasets", items, q, page, total, prev)
     tot_txt = f"{total} jeu(x)" if total is not None else f"{len(items)} jeu(x)"
     out = [note + f"🔍 data.gouv.fr — « {q} » : {tot_txt}, page {page}" + (" (« chercher suite » pour la suite)" if total and total > page * PAGE_SIZE else "")]
-    for i, d in enumerate(items, 1):
+    if dup:
+        out.append(f"({dup} doublon(s) déjà vu(s) ignoré(s))")
+    for i, d in enumerate(items, offset + 1):
         out.append(f"{i}. {_clean(d.get('title'), 70)}\n   {_org(d)} · {_formats(d)} · maj {_date(d.get('last_modified') or d.get('last_update'))}")
         ds = _desc(d)
         if ds:
@@ -321,8 +346,18 @@ def cmd_apis(words):
     return "\n".join(out)
 
 
-def cmd_infos(ref):
+def cmd_infos(ref, num=None):
     d = get_dataset(ref)
+    if num:                      # détail d'UN fichier, avec son adresse directe complète
+        res = [r for r in (d.get("resources") or []) if isinstance(r, dict)]
+        if not num.isdigit() or not 1 <= int(num) <= len(res):
+            raise DGError(f"fichier n° {num} inconnu (1 à {len(res)})")
+        r = res[int(num) - 1]
+        return "\n".join([f"📄 {_clean(r.get('title'), 100)}",
+                          f"Jeu : {_clean(d.get('title'), 80)} ({_org(d)})",
+                          f"Format : {str(r.get('format') or '?').lower()} · taille : {_size(r.get('filesize'))} · maj {_date(r.get('last_modified'))}",
+                          "Adresse directe :", str(r.get("url") or "(aucune)"),
+                          "→ pour l'utiliser dans un programme généré : --url ADRESSE --maj"])
     out = [f"📊 {_clean(d.get('title'), 100)}",
            f"Producteur : {_org(d)} · Licence : {_clean(d.get('license') or '?', 30)} · maj {_date(d.get('last_modified') or d.get('last_update'))}",
            f"id : {d.get('id')}"]
@@ -330,7 +365,7 @@ def cmd_infos(ref):
     if desc:
         out.append(desc)
     res = [r for r in (d.get("resources") or []) if isinstance(r, dict)]
-    out.append(f"Fichiers ({len(res)}) :")
+    out.append(f"Fichiers ({len(res)}) — adresse d'un fichier : infos {ref} <n° fichier> :")
     for i, r in enumerate(res[:12], 1):
         out.append(f"{i}. [{str(r.get('format') or '?').lower()}] {_clean(r.get('title'), 55)} · {_size(r.get('filesize'))} · maj {_date(r.get('last_modified'))}")
     if len(res) > 12:
@@ -397,6 +432,8 @@ Exemples :
   python3 __NAME__ --colonnes
   python3 __NAME__ --url ADRESSE_DIRECTE_CSV --maj      (autre adresse de fichier)
   python3 __NAME__ --apercu 20
+  python3 __NAME__ --lignes 100000 --colonnes          (gros fichier : ne lit que les 100 000 premières lignes)
+  python3 __NAME__ --membre nom.csv                     (archive ZIP : choisir le fichier à lire)
   python3 __NAME__ --filtre "COLONNE=valeur" --apercu 20
   python3 __NAME__ --top COLONNE 15
   python3 __NAME__ --graphe COLONNE --sortie graphique.png
@@ -404,15 +441,17 @@ Exemples :
 Les données sont celles du producteur : vérifiez leur date et leur licence avant tout usage.
 """
 import argparse
+import re
 import sys
 import urllib.request
+import zipfile
 from pathlib import Path
 
 import pandas as pd
 
 URL = __URL__
 FORMAT = __FORMAT__
-TAILLE_MAX_MO = 300                      # garde-fou : un export non filtré peut être énorme
+TAILLE_MAX_MO = 1024                     # garde-fou (1 Go) : un export non filtré peut être énorme
 COLONNES_CONNUES = __COLUMNS__          # indicatif : la lecture réelle fait foi
 DOSSIER = Path(__file__).resolve().parent / "donnees"
 FICHIER = DOSSIER / __LOCAL__
@@ -449,22 +488,108 @@ def verifier_telechargement(chemin):
                  "d'un export CSV : python3 programme.py --url ADRESSE --maj")
 
 
-def lire():
+def type_reel(chemin):
+    """'archive' (ZIP), 'xlsx', 'xls' ou 'csv' d'après le contenu réel du fichier (pas d'après son nom)."""
+    if zipfile.is_zipfile(chemin):
+        with zipfile.ZipFile(chemin) as z:
+            if any(n.startswith("xl/") for n in z.namelist()):
+                return "xlsx"
+        return "archive"
+    with open(chemin, "rb") as f:
+        if f.read(8) == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1":
+            return "xls"
+    return "csv"
+
+
+def extraire_archive(chemin, membre=None):
+    """Extrait d'une archive ZIP UN fichier tableur (CSV/TSV/Excel) vers donnees/. Protections : pas de chemin
+    fourni par l'archive (le nom de sortie est recalculé), taille limitée même si l'archive annonce moins."""
+    with zipfile.ZipFile(chemin) as z:
+        tous = [i for i in z.infolist() if not i.is_dir()]
+        tab = [i for i in tous if i.filename.lower().endswith((".csv", ".tsv", ".xlsx", ".xls"))]
+        if membre:
+            choix = [i for i in tous if i.filename == membre or Path(i.filename).name == membre]
+        else:
+            choix = tab[:1]
+        if not choix:
+            print("Contenu de l'archive :")
+            for i in tous[:40]:
+                print(f"  {i.filename}  ({i.file_size / 1048576:.1f} Mo)")
+            sys.exit("Aucun fichier CSV/Excel à lire dans cette archive (les formats géographiques — shp, geojson… — "
+                     "ne sont pas gérés)." if not membre else f"Fichier introuvable dans l'archive : {membre}")
+        info = choix[0]
+        if len(tab) > 1 and not membre:
+            print(f"L'archive contient {len(tab)} fichiers de données ; lecture du premier ({info.filename}). "
+                  "Autres : " + ", ".join(i.filename for i in tab[1:6]) + "   → --membre NOM pour choisir")
+        sortie = DOSSIER / ("extrait_" + re.sub(r"[^A-Za-z0-9._-]+", "_", Path(info.filename).name))
+        total = 0
+        with z.open(info) as src, open(sortie, "wb") as dst:
+            while True:
+                bloc = src.read(1 << 20)
+                if not bloc:
+                    break
+                total += len(bloc)
+                if total > TAILLE_MAX_MO << 20:
+                    dst.close()
+                    sortie.unlink(missing_ok=True)
+                    sys.exit(f"Extraction interrompue : plus de {TAILLE_MAX_MO} Mo décompressés.")
+                dst.write(bloc)
+        return sortie
+
+
+def detecter_csv(chemin):
+    """(séparateur, encodage) d'après les premiers Ko : UTF-8 sinon Windows-1252 ; séparateur le plus fréquent de l'entête."""
+    with open(chemin, "rb") as f:
+        echantillon = f.read(200_000)
+    enc = "cp1252"
+    try:
+        echantillon.decode("utf-8-sig")
+        enc = "utf-8-sig"
+    except UnicodeDecodeError as e:
+        if e.start >= len(echantillon) - 4:        # simple coupure au milieu d'un caractère
+            enc = "utf-8-sig"
+    texte = echantillon.decode(enc, errors="replace")
+    entete = texte.splitlines()[0] if texte.splitlines() else ""
+    sep = max((";", ",", "\t", "|"), key=entete.count)
+    return (sep if entete.count(sep) else ","), enc
+
+
+def lire(lignes=None, membre=None):
     chemin = telecharger()
     verifier_telechargement(chemin)
-    if FORMAT in ("xlsx", "xls"):
-        return pd.read_excel(chemin)
-    # CSV français : séparateur « ; » ou « , », encodage UTF-8 ou Latin-1, virgule décimale
-    # Encodage : UTF-8 d'abord, puis Windows-1252 (cas fréquent des fichiers produits sous Windows/Excel)
-    for enc in ("utf-8-sig", "cp1252", "latin-1"):
+    genre = type_reel(chemin)
+    if genre == "archive":
+        chemin = extraire_archive(chemin, membre)
+        genre = type_reel(chemin)
+        print(f"(fichier extrait : {chemin.name})")
+    if chemin.stat().st_size > 200 << 20 and not lignes:
+        print("(fichier volumineux : --lignes 100000 pour un essai rapide ; la lecture complète demande beaucoup de mémoire)")
+    if genre in ("xlsx", "xls"):
+        return nettoyer(pd.read_excel(chemin, nrows=lignes))
+    sep, enc0 = detecter_csv(chemin)
+    # Encodage : celui détecté, puis Windows-1252 et Latin-1 en secours
+    for enc in dict.fromkeys([enc0, "cp1252", "latin-1"]):
         try:
-            df = pd.read_csv(chemin, sep=None, engine="python", encoding=enc,
-                             decimal=",", dtype_backend="numpy_nullable")
+            try:
+                df = pd.read_csv(chemin, sep=sep, encoding=enc, dtype_backend="numpy_nullable", nrows=lignes)
+            except pd.errors.ParserError:      # lignes irrégulières : lecture tolérante, lignes fautives signalées
+                df = pd.read_csv(chemin, sep=sep, encoding=enc, dtype_backend="numpy_nullable", nrows=lignes,
+                                 engine="python", on_bad_lines="warn")
         except UnicodeDecodeError:
             continue
-        print(f"(encodage lu : {enc})")
-        return nettoyer(df)
+        print(f"(encodage lu : {enc} ; séparateur : {'tabulation' if sep == chr(9) else sep})")
+        return nettoyer(convertir_decimaux(df))
     sys.exit("Lecture impossible (encodage inconnu).")
+
+
+def convertir_decimaux(df):
+    """Colonnes texte qui ne contiennent que des nombres à virgule décimale (3,14) → nombres."""
+    for c in df.columns:
+        if pd.api.types.is_string_dtype(df[c]):
+            v = df[c].dropna()
+            if len(v) and v.str.contains(",", regex=False).any() and v.str.match(r"^-?\d+(,\d+)?$").all():
+                df[c] = pd.to_numeric(df[c].str.replace(",", ".", regex=False))
+    return df
 
 
 def nettoyer(df):
@@ -491,6 +616,8 @@ def main():
     p = argparse.ArgumentParser(description="Exploitation d'un fichier data.gouv.fr")
     p.add_argument("--maj", action="store_true", help="retélécharger le fichier")
     p.add_argument("--url", metavar="ADRESSE", help="adresse directe d'un fichier CSV/Excel (remplace celle du programme)")
+    p.add_argument("--lignes", type=int, metavar="N", help="ne lit que les N premières lignes (gros fichiers)")
+    p.add_argument("--membre", metavar="NOM", help="archive ZIP : nom du fichier de données à lire")
     p.add_argument("--colonnes", action="store_true", help="liste des colonnes, types et valeurs manquantes")
     p.add_argument("--apercu", type=int, metavar="N", help="affiche N lignes")
     p.add_argument("--filtre", metavar="COL=valeur", help="garde les lignes dont COL contient valeur")
@@ -505,7 +632,7 @@ def main():
         URL = a.url
     if a.maj or a.url:
         telecharger(force=True)
-    df = appliquer_filtre(lire(), a.filtre)
+    df = appliquer_filtre(lire(a.lignes, a.membre), a.filtre)
     print(f"{len(df)} ligne(s) × {len(df.columns)} colonne(s)")
 
     if a.colonnes or not any([a.apercu, a.top, a.graphe, a.export]):
@@ -562,14 +689,14 @@ def cmd_squelette(ref, num=None):
             return f"❌ {who} : fichier n° {num} inconnu (1 à {len(res)}, voir « infos {ref} »)."
         r = res[int(num) - 1]
     else:
-        r = next((x for x in res if _is_tabular(x)), None)
+        r = next((x for x in res if _is_tabular(x)), None) or next((x for x in res if _is_zip(x)), None)
         if r is None:
             return (f"❌ {who} : aucun fichier CSV/Excel (formats : {_formats(d)}).\n"
                     f"   Rappel : squelette <n° du RÉSULTAT> <n° du FICHIER> ; le n° du résultat est celui de « chercher » "
                     f"(voir « infos {ref} » pour les fichiers).")
-    fmt = _norm_format(r) or str(r.get("format") or "").strip().lower()
-    if not _is_tabular(r):
-        return f"❌ {who} : le fichier choisi est au format « {fmt or '?'} » ; seuls CSV/TSV/XLSX sont gérés."
+    fmt = _norm_format(r) or ("zip" if _is_zip(r) else str(r.get("format") or "").strip().lower())
+    if not (_is_tabular(r) or fmt == "zip"):
+        return f"❌ {who} : le fichier choisi est au format « {fmt or '?'} » ; seuls CSV/TSV/XLSX et les archives ZIP sont gérés."
     url = str(r.get("url") or "")
     try:
         _check_url(url)
@@ -578,7 +705,7 @@ def cmd_squelette(ref, num=None):
     size = r.get("filesize")
     prefix = ""
     if isinstance(size, (int, float)) and size > 200 * 1024 * 1024:
-        prefix = f"⚠️ Fichier volumineux ({_size(size)}) : le programme le téléchargera en entier.\n"
+        prefix = f"⚠️ Fichier volumineux ({_size(size)}) : téléchargé en entier ; utilisez --lignes N pour un essai rapide.\n"
     rid = str(r.get("id") or "")
     cols = _columns_from_profile(rid) if _UUID_RE.match(rid) else None
     if not cols and fmt in ("csv", "tsv"):
@@ -590,7 +717,7 @@ def cmd_squelette(ref, num=None):
     cols = cols or []
     slug = re.sub(r"[^a-z0-9]+", "_", str(d.get("slug") or d.get("id")).lower()).strip("_")[:40] or "donnees"
     name = f"exploiter_{slug}.py"
-    local = f"{slug}.{fmt if fmt in ('xlsx', 'xls') else 'csv'}"
+    local = f"{slug}.{fmt if fmt in ('xlsx', 'xls', 'zip') else 'csv'}"
     code = (_TEMPLATE
             .replace("__TITLE__", _clean(d.get("title"), 120).replace('"""', "'"))
             .replace("__ORG__", _org(d).replace('"""', "'"))
@@ -611,8 +738,11 @@ def cmd_squelette(ref, num=None):
         return f"❌ Génération impossible : {e}"
     lignes = [prefix + f"✅ Programme généré : {path}",
               f"Fichier : [{fmt}] {_clean(r.get('title'), 60)} · {_size(size)}",
-              f"Colonnes ({len(cols)}) : " + (", ".join(_clean(c, 25) for c in cols[:15]) + (" …" if len(cols) > 15 else "") if cols else "lues au premier lancement"),
-              f"Essai : cd {OUT_DIR} && python3 {name} --colonnes"]
+              f"Colonnes ({len(cols)}) : " + (", ".join(_clean(c, 25) for c in cols[:15]) + (" …" if len(cols) > 15 else "") if cols else
+                                             ("archive ZIP : contenu listé au premier lancement" if fmt == "zip" else "lues au premier lancement")),
+              f"Essai (2 lignes à saisir séparément) :",
+              f"  cd {OUT_DIR}",
+              f"  python3 {name} --colonnes"]
     return "\n".join(lignes)
 
 
@@ -884,7 +1014,7 @@ def main(argv):
         if cmd in ("apis", "api"):
             return cmd_apis(rest)
         if cmd == "infos":
-            return cmd_infos(rest[0]) if rest else "❌ Usage : infos <n°|id>"
+            return cmd_infos(rest[0], rest[1] if len(rest) > 1 else None) if rest else "❌ Usage : infos <n°|id> [n° fichier]"
         if cmd in ("squelette", "skeleton"):
             return cmd_squelette(rest[0], rest[1] if len(rest) > 1 else None) if rest else "❌ Usage : squelette <n°|id> [n° de fichier]"
         if cmd == "siren":
