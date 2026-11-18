@@ -8,20 +8,31 @@ Aucune clé d'API n'est nécessaire. Le script n'utilise que la bibliothèque st
 
 Depuis l'agent (sans IA, résultat immédiat) :
 
-| Commande                            | Effet                                                                                                  |
-|---                                  |---                                                                                                     |
-| `/data chercher <mots>`             | Liste numérotée des jeux de données (producteur, formats, date de mise à jour)                         |
-| `/data apis <mots>`                 | Liste des API publiques correspondantes                                                                |
-| `/data infos <n°>`                  | Détail d'un résultat : producteur, licence, fichiers numérotés                                         |
-| `/data squelette <n°> [n° fichier]` | Génère le programme d'exploitation (par défaut : premier fichier CSV/Excel)                            |
-| `/data siren <9 chiffres>`          | Fiche d'une entreprise : active ou cessée (Sirene, INSEE) + annonces de procédure collective (BODACC)  |
-| `/data check`                       | Diagnostic : vérifie l'accès à data.gouv.fr et la structure des réponses                               |
+| Commande                            | Effet                                                                                                 |
+|---                                  |---                                                                                                    |
+| `/data chercher <mots>`             | Liste numérotée des jeux de données (producteur, formats, date de mise à jour, début de description)  |
+| `/data chercher suite`              | Page suivante de la dernière recherche                                                                |
+| `/data apis <mots>`                 | Liste des API publiques correspondantes                                                               |
+| `/data infos <n°>`                  | Détail d'un résultat : producteur, licence, fichiers numérotés                                        |
+| `/data squelette <n°> [n° fichier]` | Génère le programme d'exploitation (par défaut : premier fichier CSV/Excel)                           |
+| `/data siren <9 chiffres>`          | Fiche d'une entreprise : active ou cessée (Sirene, INSEE) + annonces de procédure collective (BODACC) |
+| `/data check`                       | Diagnostic : vérifie l'accès à data.gouv.fr et la structure des réponses                              |
 
 En conversation, l'IA peut aussi appeler l'outil `datagouv` (« cherche des bases sur… »). Son résultat est affiché tel quel.
 
 Directement en ligne de commande : `python3 datagouv.py chercher <mots>` (mêmes sous-commandes ; `<n°>` peut être remplacé par l'identifiant ou le « slug » du jeu de données).
 
 Le numéro `<n°>` est celui de la **dernière** recherche `chercher` (mémorisé dans `datagouv_last.json`).
+
+## Bien chercher
+
+La recherche de data.gouv.fr exige **tous** les mots saisis : mieux vaut 1 ou 2 mots précis qu'une phrase. Si rien n'est trouvé, la commande essaie le singulier, puis retire des mots et le signale. Conseils :
+- partir du **thème** (« pépinières », « sirene », « logement »), puis affiner avec un lieu ou un producteur ;
+- tester un synonyme ou le singulier ;
+- regarder les formats annoncés (`csv`, `xlsx`) : seuls ceux-là donnent un programme ;
+- lire la ligne de description sous chaque titre pour juger la pertinence avant `infos`.
+
+En conversation, l'IA peut enchaîner plusieurs recherches avec des mots différents et comparer.
 
 ## Fiche entreprise (`siren`)
 
@@ -49,7 +60,7 @@ python3 exploiter_<jeu>.py --export extrait.csv
 python3 exploiter_<jeu>.py --maj                          # retélécharger le fichier
 ```
 
-Le fichier est téléchargé une fois dans `programmes/donnees/`. La lecture gère les CSV français (séparateur `;` ou `,`, UTF-8 ou Latin-1, virgule décimale). Le programme est un point de départ : il se modifie librement.
+Le fichier est téléchargé une fois dans `programmes/donnees/`. La lecture gère les CSV français (séparateur `;` ou `,`, encodage UTF-8, Windows-1252 ou Latin-1 — l'encodage lu est affiché —, virgule décimale) et réduit les suites d'espaces des colonnes texte. Un caractère déjà perdu dans le fichier d'origine (par exemple une apostrophe devenue `?`) ne peut pas être récupéré. Le programme est un point de départ : il se modifie librement.
 
 ## Sécurité
 
@@ -67,11 +78,12 @@ Le fichier est téléchargé une fois dans `programmes/donnees/`. La lecture gè
 
 ## Fichiers
 
-| Fichier              | Rôle                                                                  |
-|---                   |---                                                                    |
-| `datagouv.py`        | Le script                                                             |
-| `programmes/`        | Programmes générés (et `programmes/donnees/` : fichiers téléchargés)  |
-| `datagouv_last.json` | Derniers résultats de `chercher`                                      |
-| `.env`               | Clé d'API Sirene (privé)                                              |
+| Fichier                | Rôle                                                                  |
+|---                     |---                                                                    |
+| `datagouv.py`          | Le script                                                             |
+| `programmes/`          | Programmes générés (et `programmes/donnees/` : fichiers téléchargés)  |
+| `datagouv_last.json`   | Derniers résultats de `chercher`                                      |
+
+| `.env` | Clé d'API Sirene (privé) |
 
 À ajouter au `.gitignore` : `programmes/`, `datagouv_last.json`, `.env`.

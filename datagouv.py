@@ -2,7 +2,7 @@
 """datagouv.py — explorer data.gouv.fr (open data français) et générer des programmes d'exploitation.
 
 Sous-commandes (aucune clé API requise ; lecture seule sur le réseau) :
-  chercher <mots…>            jeux de données correspondant aux mots-clés (numérotés)
+  chercher <mots…>            jeux de données correspondant aux mots-clés (numérotés) ; « chercher suite » = page suivante
   apis <mots…>                API (« dataservices ») correspondant aux mots-clés
   infos <n|id>                détail d'un jeu de données : producteur, licence, fichiers (numérotés)
   squelette <n|id> [fichier]  génère un programme Python autonome (pandas) pour un fichier CSV/XLSX
@@ -81,7 +81,23 @@ def _check_url(url: str, hosts=None):
         raise DGError(f"adresse non publique refusée : {p.hostname}")
 
 
+_TRANSIENT = ("RemoteDisconnected", "HTTP 502", "HTTP 503", "HTTP 504", "timed out", "connexion impossible",
+              "ConnectionReset", "IncompleteRead")
+
+
 def _read(url: str, max_bytes: int, hosts=None, accept="*/*", range_bytes=None, headers=None) -> bytes:
+    """Lecture avec 2 nouvelles tentatives en cas de coupure passagère du serveur (pas pour les erreurs 4xx)."""
+    import time
+    for essai in range(3):
+        try:
+            return _read_once(url, max_bytes, hosts, accept, range_bytes, headers)
+        except DGError as e:
+            if essai == 2 or not any(t in str(e) for t in _TRANSIENT):
+                raise
+            time.sleep(1.5 * (essai + 1))
+
+
+def _read_once(url: str, max_bytes: int, hosts=None, accept="*/*", range_bytes=None, headers=None) -> bytes:
     _check_url(url, hosts)
     hdrs = {"User-Agent": UA, "Accept": accept, "Accept-Encoding": "identity"}
     if headers:
@@ -168,10 +184,10 @@ def _items(js) -> list:
     return []
 
 
-def _save_last(kind: str, items: list):
+def _save_last(kind: str, items: list, q: str = "", page: int = 1):
     try:
         LAST_FILE.write_text(json.dumps(
-            {"kind": kind, "items": [{"id": i.get("id"), "slug": i.get("slug"), "title": i.get("title")}
+            {"kind": kind, "q": q, "page": page, "items": [{"id": i.get("id"), "slug": i.get("slug"), "title": i.get("title")}
                                      for i in items]}, ensure_ascii=False), encoding="utf-8")
     except OSError:
         pass
@@ -201,25 +217,92 @@ def get_dataset(ref: str) -> dict:
     return js
 
 
+def _norm_format(r: dict) -> str:
+    """csv | tsv | xlsx | xls, ou '' si le fichier n'est pas un tableau (formats composés comme « csv-json-excel » = export CSV)."""
+    f = str(r.get("format") or "").strip().lower()
+    if f in ("csv", "tsv", "xlsx", "xls"):
+        return f
+    if "csv" in f:
+        return "csv"
+    if "xlsx" in f or "excel" in f:
+        return "xlsx"
+    return ""
+
+
 def _is_tabular(r: dict) -> bool:
-    return str(r.get("format") or "").strip().lower() in ("csv", "tsv", "xlsx", "xls")
+    return bool(_norm_format(r))
 
 
 # ─────────────────────────── commandes ───────────────────────────
-def cmd_chercher(words):
-    q = _kw(words)
-    if not q:
-        return "❌ Usage : chercher <mots-clés>   ex : chercher entreprises redressement"
-    js = get_json(f"{API}/datasets/?q={urllib.parse.quote(q)}&page_size={PAGE_SIZE}&sort=-last_modified")
-    items = _items(js)
+def _search_datasets(q: str, page: int = 1):
+    js = get_json(f"{API}/datasets/?q={urllib.parse.quote(q)}&page_size={PAGE_SIZE}" + (f"&page={page}" if page > 1 else ""))
     total = js.get("total") if isinstance(js, dict) else None
+    return _items(js), total
+
+
+def _desc(d: dict) -> str:
+    t = str(d.get("description_short") or d.get("description") or "")
+    t = re.sub(r"[#*_>`\[\]]|\(https?://[^)]*\)", " ", t)      # retire la mise en forme Markdown
+    return _clean(t, 90)
+
+
+def _last_state() -> dict:
+    try:
+        return json.loads(LAST_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def cmd_chercher(words):
+    import itertools
+    q = _kw(words)
+    page = 1
+    if q.lower() in ("suite", "page suivante", "plus"):
+        st = _last_state()
+        if st.get("kind") != "datasets" or not st.get("q"):
+            return "❌ Pas de recherche précédente : lancez d'abord « chercher <mots> »."
+        q, page = st["q"], int(st.get("page", 1)) + 1
+    if not q:
+        return "❌ Usage : chercher <mots-clés>   ex : chercher pépinières entreprises  |  chercher suite (page suivante)"
+    items, total = _search_datasets(q, page)
+    note = ""
+    ws = q.split()
+    if not items and page == 1 and any(w.lower().endswith("s") and len(w) > 4 for w in ws):
+        sing = " ".join(w[:-1] if w.lower().endswith("s") and len(w) > 4 else w for w in ws)   # pluriel → singulier
+        its, tot = _search_datasets(sing)
+        if its:
+            items, total, note, q = its, tot, f"(aucun résultat au pluriel ; recherche « {sing} »)\n", sing
+            ws = q.split()
+    if not items and page == 1 and 1 < len(ws) <= 5:
+        # La recherche exige tous les mots : on retire des mots, du plus long au plus court, et on garde
+        # parmi les combinaisons du même niveau la plus précise (le moins de résultats, mais au moins un).
+        for size in range(len(ws) - 1, 0, -1):
+            best = None
+            for combo in itertools.combinations(ws, size):
+                qq = " ".join(combo)
+                try:
+                    its, tot = _search_datasets(qq)
+                except DGError:
+                    continue
+                if its and (best is None or (tot or 10**9) < (best[2] or 10**9)):
+                    best = (qq, its, tot)
+            if best:
+                q2, items, total = best
+                note = f"(aucun jeu ne contient tous les mots ; résultats pour « {q2} »)\n"
+                q = q2
+                break
     if not items:
-        return f"🔍 Aucun jeu de données pour « {q} ». Essayez des mots plus généraux."
-    _save_last("datasets", items)
-    out = [f"🔍 data.gouv.fr — « {q} » : {total if total is not None else len(items)} jeu(x), {len(items)} affiché(s)"]
+        return (f"🔍 Aucun jeu de données pour « {q} »." if page == 1 else "🔍 Plus de résultats.") + \
+               "\n   Astuce : 1 à 2 mots précis (le thème, pas la phrase) ; essayez le singulier ou un synonyme."
+    _save_last("datasets", items, q, page)
+    tot_txt = f"{total} jeu(x)" if total is not None else f"{len(items)} jeu(x)"
+    out = [note + f"🔍 data.gouv.fr — « {q} » : {tot_txt}, page {page}" + (" (« chercher suite » pour la suite)" if total and total > page * PAGE_SIZE else "")]
     for i, d in enumerate(items, 1):
-        out.append(f"{i}. {_clean(d.get('title'), 75)}\n   {_org(d)} · {_formats(d)} · maj {_date(d.get('last_modified') or d.get('last_update'))}")
-    out.append("→ détail : infos <n°>    → programme : squelette <n°>")
+        out.append(f"{i}. {_clean(d.get('title'), 70)}\n   {_org(d)} · {_formats(d)} · maj {_date(d.get('last_modified') or d.get('last_update'))}")
+        ds = _desc(d)
+        if ds:
+            out.append(f"   {ds}")
+    out.append("→ détail : infos <n°>    → programme : squelette <n°> <n° fichier>")
     return "\n".join(out)
 
 
@@ -254,7 +337,11 @@ def cmd_infos(ref):
         out.append(f"… +{len(res) - 12} autre(s)")
     if d.get("page"):
         out.append(f"Page : {d['page']}")
-    out.append(f"→ programme : squelette {ref} [n° de fichier]")
+    first = next((i for i, r in enumerate(res, 1) if _is_tabular(r)), None)
+    if first:
+        out.append(f"→ programme : squelette {ref} <n° du fichier>   ex : squelette {ref} {first}")
+    else:
+        out.append("→ aucun fichier CSV/Excel dans ce jeu : pas de programme possible")
     return "\n".join(out)
 
 
@@ -281,6 +368,8 @@ def _columns_from_sample(url: str):
         raw = _read(url, SNIFF_BYTES, accept="text/csv,*/*", range_bytes=SNIFF_BYTES)
     except DGError:
         return None
+    if raw.lstrip()[:15].lower().startswith((b"<!doctype", b"<html")) or b"<html" in raw[:2000].lower():
+        return "HTML"
     for enc in ("utf-8-sig", "latin-1"):
         try:
             text = raw.decode(enc)
@@ -306,6 +395,7 @@ Dépendances : pandas, matplotlib (et openpyxl pour un fichier Excel).
 
 Exemples :
   python3 __NAME__ --colonnes
+  python3 __NAME__ --url ADRESSE_DIRECTE_CSV --maj      (autre adresse de fichier)
   python3 __NAME__ --apercu 20
   python3 __NAME__ --filtre "COLONNE=valeur" --apercu 20
   python3 __NAME__ --top COLONNE 15
@@ -322,6 +412,7 @@ import pandas as pd
 
 URL = __URL__
 FORMAT = __FORMAT__
+TAILLE_MAX_MO = 300                      # garde-fou : un export non filtré peut être énorme
 COLONNES_CONNUES = __COLUMNS__          # indicatif : la lecture réelle fait foi
 DOSSIER = Path(__file__).resolve().parent / "donnees"
 FICHIER = DOSSIER / __LOCAL__
@@ -333,27 +424,55 @@ def telecharger(force=False):
         return FICHIER
     print(f"Téléchargement : {URL}")
     req = urllib.request.Request(URL, headers={"User-Agent": "Mozilla/5.0 (programme datagouv)"})
+    total = 0
     with urllib.request.urlopen(req, timeout=120) as r, open(FICHIER, "wb") as f:
         while True:
             bloc = r.read(1 << 20)
             if not bloc:
                 break
+            total += len(bloc)
+            if total > TAILLE_MAX_MO << 20:
+                f.close()
+                FICHIER.unlink(missing_ok=True)
+                sys.exit(f"Téléchargement interrompu : plus de {TAILLE_MAX_MO} Mo (modifiez TAILLE_MAX_MO si voulu).")
             f.write(bloc)
     return FICHIER
 
 
+def verifier_telechargement(chemin):
+    """Refuse (et supprime) un « fichier » qui est en réalité une page web."""
+    with open(chemin, "rb") as f:
+        debut = f.read(2000).lower()
+    if debut.lstrip().startswith((b"<!doctype", b"<html")) or b"<html" in debut:
+        chemin.unlink(missing_ok=True)
+        sys.exit("L'adresse renvoie une page web, pas un fichier de données. Fournissez l'adresse directe "
+                 "d'un export CSV : python3 programme.py --url ADRESSE --maj")
+
+
 def lire():
     chemin = telecharger()
+    verifier_telechargement(chemin)
     if FORMAT in ("xlsx", "xls"):
         return pd.read_excel(chemin)
     # CSV français : séparateur « ; » ou « , », encodage UTF-8 ou Latin-1, virgule décimale
-    for enc in ("utf-8-sig", "latin-1"):
+    # Encodage : UTF-8 d'abord, puis Windows-1252 (cas fréquent des fichiers produits sous Windows/Excel)
+    for enc in ("utf-8-sig", "cp1252", "latin-1"):
         try:
-            return pd.read_csv(chemin, sep=None, engine="python", encoding=enc,
-                               decimal=",", dtype_backend="numpy_nullable")
+            df = pd.read_csv(chemin, sep=None, engine="python", encoding=enc,
+                             decimal=",", dtype_backend="numpy_nullable")
         except UnicodeDecodeError:
             continue
+        print(f"(encodage lu : {enc})")
+        return nettoyer(df)
     sys.exit("Lecture impossible (encodage inconnu).")
+
+
+def nettoyer(df):
+    """Réduit les suites d'espaces/retours de ligne des colonnes texte (fréquentes dans les fichiers saisis à la main)."""
+    for c in df.columns:
+        if pd.api.types.is_string_dtype(df[c]):
+            df[c] = df[c].str.replace(r"\s{2,}", " ", regex=True).str.strip()
+    return df
 
 
 def appliquer_filtre(df, filtre):
@@ -371,6 +490,7 @@ def appliquer_filtre(df, filtre):
 def main():
     p = argparse.ArgumentParser(description="Exploitation d'un fichier data.gouv.fr")
     p.add_argument("--maj", action="store_true", help="retélécharger le fichier")
+    p.add_argument("--url", metavar="ADRESSE", help="adresse directe d'un fichier CSV/Excel (remplace celle du programme)")
     p.add_argument("--colonnes", action="store_true", help="liste des colonnes, types et valeurs manquantes")
     p.add_argument("--apercu", type=int, metavar="N", help="affiche N lignes")
     p.add_argument("--filtre", metavar="COL=valeur", help="garde les lignes dont COL contient valeur")
@@ -380,7 +500,10 @@ def main():
     p.add_argument("--export", metavar="FICHIER.csv", help="enregistre les lignes retenues")
     a = p.parse_args()
 
-    if a.maj:
+    if a.url:
+        global URL
+        URL = a.url
+    if a.maj or a.url:
         telecharger(force=True)
     df = appliquer_filtre(lire(), a.filtre)
     print(f"{len(df)} ligne(s) × {len(df.columns)} colonne(s)")
@@ -431,19 +554,22 @@ def cmd_squelette(ref, num=None):
     from datetime import date
     d = get_dataset(ref)
     res = [r for r in (d.get("resources") or []) if isinstance(r, dict)]
+    who = f"Jeu « {_clean(d.get('title'), 50)} » ({_org(d)})"
     if not res:
-        return "❌ Ce jeu de données ne contient aucun fichier."
+        return f"❌ {who} : aucun fichier."
     if num:
         if not num.isdigit() or not 1 <= int(num) <= len(res):
-            return f"❌ Fichier n° {num} inconnu (1 à {len(res)}, voir « infos »)."
+            return f"❌ {who} : fichier n° {num} inconnu (1 à {len(res)}, voir « infos {ref} »)."
         r = res[int(num) - 1]
     else:
         r = next((x for x in res if _is_tabular(x)), None)
         if r is None:
-            return "❌ Aucun fichier CSV/Excel dans ce jeu de données (formats : " + _formats(d) + ")."
-    fmt = str(r.get("format") or "").strip().lower()
+            return (f"❌ {who} : aucun fichier CSV/Excel (formats : {_formats(d)}).\n"
+                    f"   Rappel : squelette <n° du RÉSULTAT> <n° du FICHIER> ; le n° du résultat est celui de « chercher » "
+                    f"(voir « infos {ref} » pour les fichiers).")
+    fmt = _norm_format(r) or str(r.get("format") or "").strip().lower()
     if not _is_tabular(r):
-        return f"❌ Le fichier choisi est au format « {fmt or '?'} » : seuls CSV/TSV/XLSX sont gérés."
+        return f"❌ {who} : le fichier choisi est au format « {fmt or '?'} » ; seuls CSV/TSV/XLSX sont gérés."
     url = str(r.get("url") or "")
     try:
         _check_url(url)
@@ -454,8 +580,14 @@ def cmd_squelette(ref, num=None):
     if isinstance(size, (int, float)) and size > 200 * 1024 * 1024:
         prefix = f"⚠️ Fichier volumineux ({_size(size)}) : le programme le téléchargera en entier.\n"
     rid = str(r.get("id") or "")
-    cols = (_columns_from_profile(rid) if _UUID_RE.match(rid) else None) or \
-           (_columns_from_sample(url) if fmt in ("csv", "tsv") else None) or []
+    cols = _columns_from_profile(rid) if _UUID_RE.match(rid) else None
+    if not cols and fmt in ("csv", "tsv"):
+        cols = _columns_from_sample(url)
+        if cols == "HTML":
+            return ("❌ Ce lien est une page web (HTML), pas un fichier de données : aucun programme n'est généré.\n"
+                    "   Le producteur propose un export à construire sur son site. Choisissez un autre fichier du jeu "
+                    "(infos <n°>), ou récupérez l'adresse directe d'un export CSV et passez-la au programme.")
+    cols = cols or []
     slug = re.sub(r"[^a-z0-9]+", "_", str(d.get("slug") or d.get("id")).lower()).strip("_")[:40] or "donnees"
     name = f"exploiter_{slug}.py"
     local = f"{slug}.{fmt if fmt in ('xlsx', 'xls') else 'csv'}"
@@ -568,29 +700,75 @@ def _sirene_get(siren: str) -> dict:
     raise DGError(last or "erreur Sirene")
 
 
-def _bodacc_collectives(siren: str):
-    """Annonces de procédures collectives pour ce SIREN (liste), ou None si le BODACC est injoignable."""
+_BODACC_FORM = [None]       # forme de filtre retenue (diagnostic)
+
+
+def _bodacc_forms(siren: str):
     spaced = f"{siren[:3]} {siren[3:6]} {siren[6:]}"
-    where_forms = (f'search(registre, "{spaced}")', f'registre:"{spaced}"', f'registre like "{spaced}"')
-    data = None
-    for w in where_forms:
-        q = urllib.parse.urlencode({"where": w, "order_by": "dateparution desc", "limit": 50})
-        try:
-            raw = _read(f"{BODACC_URL}?{q}", JSON_MAX, hosts={"bodacc-datadila.opendatasoft.com"}, accept="application/json")
-            data = json.loads(raw.decode("utf-8", "replace"))
+    return ({"where": f'search(registre, "{spaced}")'}, {"where": f'registre:"{spaced}"'},
+            {"where": f'registre like "{spaced}"'}, {"refine": f'registre:"{spaced}"'})
+
+
+def _bodacc_calibrate() -> str:
+    """Prend un SIREN réellement présent dans une annonce récente, puis teste chaque forme de filtre :
+    une forme est « fiable » si elle retrouve une annonce portant ce SIREN. (Le SIREN n'est pas affiché.)"""
+    q = urllib.parse.urlencode({"order_by": "dateparution desc", "limit": 20})
+    raw = _read(f"{BODACC_URL}?{q}", JSON_MAX, hosts={"bodacc-datadila.opendatasoft.com"}, accept="application/json")
+    rows = [r for r in (json.loads(raw.decode("utf-8", "replace")).get("results") or []) if isinstance(r, dict)]
+    siren = None
+    for r in rows:
+        reg = r.get("registre")
+        for v in (reg if isinstance(reg, list) else [reg]):
+            d = re.sub(r"\D", "", str(v or ""))
+            if len(d) == 9:
+                siren = d
+                break
+        if siren:
             break
+    if not siren:
+        return "champ « registre » introuvable dans les annonces récentes (noms de champs : " + ", ".join(sorted(rows[0])[:12]) + ")" if rows else "aucune annonce récente lue"
+    res = []
+    for i, extra in enumerate(_bodacc_forms(siren), 1):
+        try:
+            raw = _read(f"{BODACC_URL}?{urllib.parse.urlencode(dict(extra, limit=20))}", JSON_MAX,
+                        hosts={"bodacc-datadila.opendatasoft.com"}, accept="application/json")
+            rr = [r for r in (json.loads(raw.decode("utf-8", "replace")).get("results") or []) if isinstance(r, dict)]
+            ok = any(_registre_has(r, siren) for r in rr)
+            res.append(f"{i}:{'fiable' if ok else ('vide' if not rr else 'hors-sujet')}")
+        except (DGError, ValueError) as e:
+            res.append(f"{i}:erreur")
+    return "formes de filtre → " + " ".join(res)
+
+
+def _registre_has(r: dict, siren: str) -> bool:
+    """Vrai seulement si l'annonce porte bien CE numéro SIREN dans son champ « registre »
+    (le filtre distant n'est jamais cru sur parole)."""
+    reg = r.get("registre")
+    vals = reg if isinstance(reg, list) else [reg]
+    return any(re.sub(r"\D", "", str(v or "")) == siren for v in vals)
+
+
+def _bodacc_collectives(siren: str):
+    """Annonces de procédures collectives de ce SIREN, vérifiées une à une ; None si impossible à établir."""
+    forms = _bodacc_forms(siren)
+    genuine_empty = False
+    for i, extra in enumerate(forms):
+        params = dict(extra, order_by="dateparution desc", limit=100)
+        try:
+            raw = _read(f"{BODACC_URL}?{urllib.parse.urlencode(params)}", JSON_MAX,
+                        hosts={"bodacc-datadila.opendatasoft.com"}, accept="application/json")
+            data = json.loads(raw.decode("utf-8", "replace"))
         except (DGError, ValueError):
             continue
-    if not isinstance(data, dict):
-        return None
-    out = []
-    for r in data.get("results") or []:
-        if not isinstance(r, dict):
-            continue
-        fam = f"{r.get('familleavis', '')} {r.get('familleavis_lib', '')}".lower()
-        if "collective" in fam:
-            out.append(r)
-    return out
+        rows = [r for r in (data.get("results") or []) if isinstance(r, dict)] if isinstance(data, dict) else []
+        mine = [r for r in rows if _registre_has(r, siren)]
+        if mine:
+            _BODACC_FORM[0] = i + 1
+            return [r for r in mine if "collective" in f"{r.get('familleavis', '')} {r.get('familleavis_lib', '')}".lower()]
+        if isinstance(data, dict) and not rows:
+            genuine_empty = True
+    _BODACC_FORM[0] = None
+    return [] if genuine_empty else None
 
 
 def _jugement_text(r: dict) -> str:
@@ -634,7 +812,7 @@ def cmd_siren(words):
         out.append(f"Effectifs : {_EFFECTIFS.get(eff, eff)}" + (f" (année {ul['anneeEffectifsUniteLegale']})" if ul.get("anneeEffectifsUniteLegale") else ""))
     bod = _bodacc_collectives(siren)
     if bod is None:
-        out.append("⚠️ BODACC injoignable : procédures collectives non vérifiées.")
+        out.append("⚠️ BODACC : procédures collectives non vérifiables (service injoignable ou filtre non fiable) : consultez bodacc.fr.")
     elif not bod:
         out.append("⚖️ BODACC : aucune annonce de procédure collective trouvée.")
     else:
@@ -685,9 +863,14 @@ def cmd_check():
         out.append(f"❌ Sirene : {e}")
     try:
         b = _bodacc_collectives("120027016")
-        out.append("✅ BODACC joignable" if b is not None else "❌ BODACC : aucune des requêtes n'a abouti")
+        out.append("✅ BODACC joignable ; filtre n° " + str(_BODACC_FORM[0]) if _BODACC_FORM[0] else
+                   ("ℹ️ BODACC : aucune annonce pour ce SIREN (filtre non confirmé)" if b == [] else "❌ BODACC : filtre non fiable, aucune annonce vérifiable"))
     except DGError as e:
         out.append(f"❌ BODACC : {e}")
+    try:
+        out.append("ℹ️ BODACC calibrage : " + _bodacc_calibrate())
+    except (DGError, ValueError) as e:
+        out.append(f"ℹ️ BODACC calibrage impossible : {e}")
     return "\n".join(out)
 
 
